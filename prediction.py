@@ -7,13 +7,14 @@ import matplotlib.dates as mdates
 # -------- Configurable Parameters --------
 NUM_DAYS = 1                # Change number of days to predict
 HOURS_PER_DAY = 24          # Change hours per day (e.g. 24, 48, etc.)
-DISPLAY_OPTION = "both"     # Options: "predicted", "both"
+DISPLAY_OPTION = "predicted"     # Options: "predicted", "both"
 
 # -------- Paths --------
 data_folder = r"C:\Users\anand\Documents\energy prediction\data"
 comparison_folder = r"C:\Users\anand\Documents\energy prediction\comparison"
 actual_file = os.path.join(comparison_folder, "actual_energy.xlsx")
 forecast_file = os.path.join(comparison_folder, "next_day_forecast.csv")
+error_log_file = os.path.join(comparison_folder, "forecast_error_log.csv")
 
 # -------- Step 1: Load and Combine Excel Files --------
 excel_files = [os.path.join(data_folder, f) for f in os.listdir(data_folder) if f.endswith(('.xlsx', '.xls'))]
@@ -35,28 +36,46 @@ for file in excel_files:
 
 combined_df = pd.concat(all_data).sort_values('ds').reset_index(drop=True)
 
-# -------- Step 2: Train Prophet --------
+# -------- Step 2: Load error log and add rolling error regressor --------
+if os.path.exists(error_log_file):
+    error_df = pd.read_csv(error_log_file, parse_dates=['ds'])
+    error_df = error_df.sort_values('ds')
+    error_df['rolling_error'] = error_df['Error'].rolling(window=24, min_periods=1).mean()
+    error_df = error_df[['ds', 'rolling_error']]
+    combined_df = pd.merge(combined_df, error_df, on='ds', how='left')
+    combined_df['rolling_error'].fillna(0, inplace=True)
+else:
+    print("⚠️ No error log found — proceeding without rolling error regressor.")
+    combined_df['rolling_error'] = 0
+
+# -------- Step 3: Train Prophet with regressor --------
 model = Prophet(
     daily_seasonality=True,
     weekly_seasonality=True,
     yearly_seasonality=False
 )
-model.fit(combined_df)
+model.add_regressor('rolling_error')
+model.fit(combined_df[['ds', 'y', 'rolling_error']])
 
-# -------- Step 3: Predict Future --------
+# -------- Step 4: Predict Future --------
 last_timestamp = combined_df['ds'].max()
 total_hours = NUM_DAYS * HOURS_PER_DAY
 
 future = model.make_future_dataframe(periods=total_hours, freq='H')
 future = future[future['ds'] > last_timestamp]
+
+# Use the last known rolling error as the future regressor value
+last_known_error = combined_df['rolling_error'].iloc[-1]
+future['rolling_error'] = last_known_error
+
 forecast = model.predict(future)
 
-# -------- Step 4: Save Forecast CSV (overwrite) --------
+# -------- Step 5: Save Forecast CSV (overwrite) --------
 os.makedirs(comparison_folder, exist_ok=True)
 forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].to_csv(forecast_file, index=False)
 print(f"Forecast saved to '{forecast_file}'")
 
-# -------- Step 5: Load Actual Energy Data --------
+# -------- Step 6: Load Actual Energy Data --------
 if not os.path.exists(actual_file):
     print(f"⚠️  Actual energy file not found: {actual_file}")
     actual_df = pd.DataFrame()
@@ -66,10 +85,11 @@ else:
     actual_df['ds'] = pd.to_datetime(actual_df['Date'].astype(str) + ' ' + actual_df['Hour'].astype(str))
     actual_df = actual_df[['ds', 'Actual']]
 
-# -------- Step 6: Merge Actual + Predicted --------
+# -------- Step 7: Merge Actual + Predicted and Log Errors --------
 if not actual_df.empty:
     merged = pd.merge(forecast[['ds', 'yhat']], actual_df, on='ds', how='inner')
-    # -------- Step 7: Calculate Accuracy --------
+
+    # Calculate errors
     merged['Error'] = merged['yhat'] - merged['Actual']
     merged['Absolute_Error'] = merged['Error'].abs()
     merged['APE'] = (merged['Absolute_Error'] / merged['Actual'].replace(0, 1)) * 100  # Avoid div by zero
@@ -79,6 +99,21 @@ if not actual_df.empty:
 
     print(f"\nOverall Prediction Accuracy: {accuracy:.2f}%")
     print(f"Mean Absolute Percentage Error (MAPE): {mape:.2f}%")
+
+    # -------- Step 7.5: Log Errors --------
+    log_df = merged[['ds', 'yhat', 'Actual', 'Error', 'Absolute_Error', 'APE']]
+    log_df['Date'] = log_df['ds'].dt.date
+    log_df['Hour'] = log_df['ds'].dt.hour
+
+    if os.path.exists(error_log_file):
+        existing_log = pd.read_csv(error_log_file, parse_dates=['ds'])
+        combined_log = pd.concat([existing_log, log_df]).drop_duplicates(subset=['ds'])
+    else:
+        combined_log = log_df
+
+    combined_log.to_csv(error_log_file, index=False)
+    print(f"📊 Error log updated at: {error_log_file}")
+
 else:
     merged = forecast[['ds', 'yhat']].copy()
     print("\n⚠️  Skipping accuracy calculation - actual data not found.")
@@ -102,7 +137,6 @@ plt.ylabel("Energy Consumed (kVAh)")
 plt.xticks(rotation=45)
 plt.grid(True)
 plt.legend()
-
 plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
 plt.tight_layout()
 plt.show()
